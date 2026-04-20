@@ -2,11 +2,11 @@
 Browser-based fetcher for Pokemon Center.
 
 Uses Playwright to launch a real Chromium browser in the background,
-which can solve Incapsula's JavaScript challenges. Slower than plain
-HTTP but reliable against bot detection.
+which can solve Incapsula's JavaScript challenges.
 
-One browser instance is kept alive for the lifetime of the bot to
-avoid the overhead of launching Chromium on every fetch.
+Each calling thread gets its OWN browser instance (Playwright's sync
+API can't be shared across threads). This means two browsers run
+total — one for the queue monitor, one for the product monitor.
 """
 
 import threading
@@ -14,20 +14,16 @@ import json
 from playwright.sync_api import sync_playwright
 
 
-# Keep one browser + context alive across all fetches
-_playwright   = None
-_browser      = None
-_context      = None
-_browser_lock = threading.Lock()
+# Thread-local storage — each thread gets its own browser/context
+_thread_local = threading.local()
 
 
 def _ensure_browser():
-    """Lazy-start the browser on first use, then keep it alive."""
-    global _playwright, _browser, _context
-    if _browser is None:
-        print("  🌐 Launching headless Chromium...")
-        _playwright = sync_playwright().start()
-        _browser = _playwright.chromium.launch(
+    """Lazy-start a browser for the current thread on first use."""
+    if not hasattr(_thread_local, "browser") or _thread_local.browser is None:
+        print(f"  🌐 Launching headless Chromium for thread {threading.current_thread().name}...")
+        _thread_local.playwright = sync_playwright().start()
+        _thread_local.browser = _thread_local.playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -35,7 +31,7 @@ def _ensure_browser():
                 "--disable-blink-features=AutomationControlled",
             ],
         )
-        _context = _browser.new_context(
+        _thread_local.context = _thread_local.browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -45,51 +41,45 @@ def _ensure_browser():
             locale="en-US",
             timezone_id="America/Phoenix",
         )
-        print("  ✅ Browser ready")
+        print(f"  ✅ Browser ready for thread {threading.current_thread().name}")
 
 
 def fetch_url_json(url, timeout_ms=30000):
     """
     Navigate to a URL and return the response body parsed as JSON.
-    The browser handles any JS challenges automatically.
-    Returns the parsed JSON dict, or raises an exception on failure.
+    Must be called from the same thread that will own its browser.
     """
-    with _browser_lock:
-        _ensure_browser()
-        page = _context.new_page()
-        try:
-            # Navigate and wait for the network to settle (challenge solved)
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            # The JSON body is rendered inside a <pre> tag by the browser
-            body = page.evaluate("() => document.body.innerText")
-            return json.loads(body)
-        finally:
-            page.close()
+    _ensure_browser()
+    page = _thread_local.context.new_page()
+    try:
+        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        body = page.evaluate("() => document.body.innerText")
+        return json.loads(body)
+    finally:
+        page.close()
 
 
 def fetch_url_html(url, timeout_ms=30000):
     """
-    Navigate to a URL and return the final URL + rendered HTML.
-    Returns a tuple: (final_url_lowercase, html_body_lowercase).
+    Navigate to a URL and return (final_url, html) both lowercased.
+    Must be called from the same thread that will own its browser.
     """
-    with _browser_lock:
-        _ensure_browser()
-        page = _context.new_page()
-        try:
-            response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            final_url = page.url.lower()
-            html      = page.content().lower()
-            return final_url, html
-        finally:
-            page.close()
+    _ensure_browser()
+    page = _thread_local.context.new_page()
+    try:
+        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        final_url = page.url.lower()
+        html      = page.content().lower()
+        return final_url, html
+    finally:
+        page.close()
 
 
 def close_browser():
-    """Clean shutdown (only matters if you're manually testing)."""
-    global _playwright, _browser, _context
-    if _browser is not None:
-        _browser.close()
-        _browser = None
-    if _playwright is not None:
-        _playwright.stop()
-        _playwright = None
+    """Clean up the current thread's browser."""
+    if hasattr(_thread_local, "browser") and _thread_local.browser is not None:
+        _thread_local.browser.close()
+        _thread_local.browser = None
+    if hasattr(_thread_local, "playwright") and _thread_local.playwright is not None:
+        _thread_local.playwright.stop()
+        _thread_local.playwright = None
