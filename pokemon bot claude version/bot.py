@@ -33,6 +33,8 @@ import threading
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+import browser_fetch
+
 
 # ============================================================
 # CONFIGURATION — Edit these before running
@@ -295,36 +297,15 @@ def send_telegram(message, silent=False):
 
 def fetch_products():
     """
-    Fetch Pokemon Center's product catalog from their public
-    Shopify /products.json endpoint. Retries up to 3x with
-    rotating User-Agents if we get blocked.
+    Fetch Pokemon Center's product catalog via a real headless browser.
+    This defeats Incapsula's JavaScript challenge that blocks plain HTTP.
     """
     url = "https://www.pokemoncenter.com/products.json?limit=250"
-    waits = [0, 20, 60]
-
-    for attempt, wait in enumerate(waits):
-        if wait:
-            print(f"  ⏳ Retry in {wait}s ({attempt + 1}/3)")
-            time.sleep(wait)
-        try:
-            r = requests.get(url, headers=get_headers(), timeout=20)
-            if r.status_code == 200:
-                try:
-                    return r.json().get("products", [])
-                except ValueError:
-                    print(f"  ⚠️  Non-JSON response ({attempt + 1}/3)")
-                    continue
-            elif r.status_code in (403, 429):
-                print(f"  ⚠️  HTTP {r.status_code} blocked ({attempt + 1}/3)")
-                continue
-            else:
-                r.raise_for_status()
-        except requests.exceptions.Timeout:
-            print(f"  ⚠️  Timed out ({attempt + 1}/3)")
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠️  Request error: {e} ({attempt + 1}/3)")
-
-    raise Exception("All 3 fetch attempts failed")
+    try:
+        data = browser_fetch.fetch_url_json(url)
+        return data.get("products", [])
+    except Exception as e:
+        raise Exception(f"Browser fetch failed: {e}")
 
 
 # ============================================================
@@ -340,18 +321,11 @@ def check_queue_active():
               (None,  None)    — couldn't check (network error)
     """
     try:
-        r = requests.get(
-            "https://www.pokemoncenter.com",
-            headers=get_headers(),
-            timeout=15,
-            allow_redirects=True,
-        )
+        final_url, body = browser_fetch.fetch_url_html("https://www.pokemoncenter.com")
 
         # Signal 1: redirect to queue/waiting URL
-        if any(w in r.url.lower() for w in ["queue", "waiting", "waitingroom"]):
+        if any(w in final_url for w in ["queue", "waiting", "waitingroom"]):
             return True, "redirected to queue URL"
-
-        body = r.text.lower()
 
         # Signal 2: explicit queue page text
         for signal in [
@@ -364,16 +338,14 @@ def check_queue_active():
             if signal in body:
                 return True, f"queue text detected: '{signal}'"
 
-        # Signal 3: Incapsula headers + high-demand body text
-        headers_str = str(r.headers).lower()
-        if any(s in headers_str for s in ["incap_ses", "visid_incap", "reese84", "queue-it"]):
-            for signal in ["please wait", "high demand", "queue-it"]:
-                if signal in body:
-                    return True, f"incapsula queue: '{signal}'"
+        # Signal 3: high-demand body text (incapsula signal in browser context)
+        for signal in ["please wait", "high demand", "queue-it"]:
+            if signal in body:
+                return True, f"queue-like text: '{signal}'"
 
         return False, None
 
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"  ⚠️  Queue check error: {e}")
         return None, None
 
